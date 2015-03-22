@@ -19,6 +19,9 @@
 SENDER:
 - Read in a file generated, break it into 1000 byte packets, add a control hearder to packet
 - Send file to the receiver through congested link
+- Print out the amount of time to transfer the file
+  - start time = at rel_init()  <-- use clock_gettime()
+  - finish time = at rel_destroy()
 
 
 
@@ -50,13 +53,15 @@ len, seqno, ackno use BIG ENDIAN
 */
 
 
-/*
-TODO:
-- read through requirements section
 
+
+/* AT THE BEGINNING OF THE PROGRAM
+//TODO:
+1. receiver should send the sender an EOF to tell the sender that it does not have any data to send
+  - consider using conn_sendpkt() in rlib.c
 */
 
-
+#define MAX_BUFFER_SIZE 2000 //TODO: change this value
 
 struct reliable_state {
   rel_t *next;			/* Linked list for traversing all connections */
@@ -65,11 +70,31 @@ struct reliable_state {
   conn_t *c;			/* This is the connection object */
 
   /* Add your own data fields below this */
+  sliding_window_sender_buffer *sendingWindow;
+  sliding_window_receiver_buffer *receivingWindow;
 
 };
 rel_t *rel_list;
 
+//TODO: finish wrapper struct
+struct packet_wrapper{
+  packet_t *packet;
+  int timeLastTransmitted;
+}
 
+
+struct sliding_window_sender_buffer{
+  packet_t *lastAcknowledged;
+  packet_t *lastSent;
+  packet_t *mostRecentAdd;
+  int bufferSize;
+};
+
+struct sliding_window_receiver_buffer{
+  packet_t *lastFrameReceived;
+  int largestAcceptableFrame;
+  int bufferSize;
+};
 
 
 
@@ -115,6 +140,7 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
  * 4. You have written all output data with conn_output
  *
  * One side must wait 2*MSS before destroying the connection (incase the last ACK gets lost)
+ * both the sender and the receiver should be able to close the connection
 */
 void
 rel_destroy (rel_t *r)
@@ -125,6 +151,8 @@ rel_destroy (rel_t *r)
   conn_destroy (r->c);
 
   /* Free any other allocated memory here */
+
+  //CONSIDER: conn_free() in rlib.c
 }
 
 
@@ -149,11 +177,73 @@ rel_demux (const struct config_common *cc, const struct sockaddr_storage *ss, pa
 
 /* This function is called by the library when a packet is received 
  * and supplied you with the packet
- *
+ * 
 */
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
+  if(pkt->len == 12){
+    //ACK
+    int recAckNo = pkt->ackno;
+    packet_t *lastAcknowledged = r->sendingWindow->lastAcknowledged;
+    if(lastAcknowledged == NULL){
+      lastAcknowledged = pkt;
+    }
+    packet_t *tempLastAck = lastAcknowledged;
+    while(recAckNo > tempLastAck->ackno){
+      tempLastAck = tempLastAck->next;
+      tempLastAck->prev = NULL;
+      free(lastAcknowledged);
+      lastAcknowledged = tempLastAck;
+    }
+  }
+  else{
+    //DATA
+    //TODO: CALL rel_out
+    packet_t lastReceivedPacket = r->receivingWindow->lastFrameReceived;
+    int largestAcceptableSeqNo = r->receivingWindow->largestAcceptableFrame;
+    if(lastReceivedPacket == NULL){
+      //First packet in the link list (haven't seen a packet before this)
+      lastReceivedPacket = pkt;
+      //TODO: Calculate Window Size
+       r->receivingWindow->largestAcceptableFrame = pkt->seqno + WINDOWSIZE;
+    }
+    else{
+
+      //Receiving Window Exists
+      
+      if(pkt->seqno == lastReceivedPacket->seqno +1 && pkt->seqno <= r->receivingWindow->largestAcceptableFrame){
+        pkt->next = lastReceivedPacket->next;
+        pkt->prev = NULL;
+        free(lastReceivedPacket);
+        lastReceivedPacket = pkt;
+        r->receivingWindow->largestAcceptableFrame +=1;
+        
+
+
+        packet_t *temp;
+        while(lastReceivedPacket->next != NULL){
+          temp = lastReceivedPacket->next;
+          if(lastReceivedPacket->seqno == temp->seqno - 1){
+            temp->prev = NULL;
+            free(lastReceivedPacket);
+            lastReceivedPacket = temp;
+            r->receivingWindow->largestAcceptableFrame +=1;
+          }
+          else{
+            break;
+          }
+        }
+        //Send Ack for updates
+        ack_packet *ack = (ack_packet*) malloc(sizeof(ack_packet));
+        ack->cksum = 0; //TODO: Implement Checksum
+        ack->len = 12;
+        ack->ackno = lastReceivedPacket->seqno+1;
+
+        conn_sendpkt(r->c, ack, ack->len);
+      }
+    }
+  }
 
 
 }
@@ -171,13 +261,46 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 void
 rel_read (rel_t *s)
 {
+  char buffer[1000];
+  while(1){
+    int conn_stdin_value = conn_input(s->c, buffer, 1000);
 
+    if(conn_stdin_value <= 0){
+      break;
+    }
+    else{
+      packet_t *newPacket = (packet_t*) malloc(sizeof(packet_t));
+      
+
+      if(s->sendingWindow->mostRecentAdd == NULL){
+        newPacket->seqno = 0;
+        s->sendingWindow->mostRecentAdd = newPacket;
+      }
+      else{
+        newPacket->seqno = s->mostRecentAdd->seqno + 1;
+      }
+      
+      newPacket->len = strln(buffer) + sizeof(packet_t); //TODO: maybe subtract 500 for data built in
+      strcpy(newPacket->data, buffer);
+      
+      //TODO: make this a method
+      s->sendingWindow->mostRecentAdd->next = newPacket;
+      newPacket->prev = s->sendingWindow->mostRecentAdd;
+      s->sendingWindow->mostRecentAdd = newPacket;
+      s->sendingWindow->lastSent = newPacket;
+
+      conn_sendpkt(s->c, newPacket, newPacket->len);
+    }
+  }
+
+  return;
 }
 
 
 
+
 /* This function is called by the library when output has drained 
- * Call conn_output it writes to STDOUT
+ * Call conn_output, it writes to STDOUT
  * conn_bufspace is useful --> tells how much space is availale for use by conn_output
  * DO NOT WRITE MORE THAN conn_bufspace Bytes 
  * 
@@ -191,6 +314,17 @@ rel_read (rel_t *s)
 void
 rel_output (rel_t *r)
 {
+ size_t availableSpace = conn_bufspace(r->c);
+ size_t bytesWritten = 0;
+ rel_t data = r->c->rel;
+
+ while(__Bytes still to write ____ && (bytesWritten < availableSpace)){
+    //int conn_output (conn_t *c, const void *_buf, size_t _n)
+    conn_output(connection)
+
+    bytesWritten += _____Bytes in packet____;
+}
+ 
 
 }
 
@@ -200,6 +334,8 @@ rel_output (rel_t *r)
  * 
  * DO NOT retransmit every packet, every time the time is fired!
  * ^^Keep track of which packets need to be retransmitted and when
+ *
+ * can use clock_gettime() in rlib.c
 */
 void
 rel_timer ()

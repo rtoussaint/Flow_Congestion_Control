@@ -121,6 +121,7 @@ clock_gettime (int id, struct timespec *tp)
 }
 #endif /* NEED_CLOCK_GETTIME */
 
+/* Useful for debugging */
 void
 print_pkt (const packet_t *buf, const char *op, int n)
 {
