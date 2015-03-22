@@ -79,22 +79,31 @@ rel_t *rel_list;
 //TODO: finish wrapper struct
 struct packet_wrapper{
   packet_t *packet;
-  int timeLastTransmitted;
+  int transmissionTimeoutNum;
+
 }
 
 
 struct sliding_window_sender_buffer{
-  packet_t *lastAcknowledged;
-  packet_t *lastSent;
-  packet_t *mostRecentAdd;
+  packet_wrapper *lastAcknowledged;
+  packet_wrapper *lastSent;
+  packet_wrapper *mostRecentAdd;
   int bufferSize;
 };
 
 struct sliding_window_receiver_buffer{
-  packet_t *lastFrameReceived;
+  packet_wrapper *lastFrameReceived;
   int largestAcceptableFrame;
   int bufferSize;
 };
+
+struct rel_session{
+  rel_t *next;
+  rel_t *prev;
+  rel_t *session;
+}
+struct rel_session *sessionList;
+
 
 
 
@@ -127,6 +136,22 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   rel_list = r;
 
   /* Do any other initialization you need here */
+  
+  //Linklist of sessions
+  if(sessionList == NULL){
+    sessionList = (struct rel_session*) malloc(sizeof(struct rel_session));
+    sessionList->session = r;
+  }
+  else{
+    struct rel_session *temp = sessionList;
+    while(temp->next != NULL){
+      temp = temp->next;
+
+    }
+    struct rel_session *newSession = (struct rel_session*) malloc(sizeof(struct rel_session));
+    temp->next = newSession;
+    newSession->prev = temp;
+  }
 
 
   return r;
@@ -185,11 +210,11 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
   if(pkt->len == 12){
     //ACK
     int recAckNo = pkt->ackno;
-    packet_t *lastAcknowledged = r->sendingWindow->lastAcknowledged;
-    if(lastAcknowledged == NULL){
-      lastAcknowledged = pkt;
+    packet_wrapper *lastAcknowledged = r->sendingWindow->lastAcknowledged;
+    if(lastAcknowledged->packet == NULL){
+      lastAcknowledged->packet = pkt;
     }
-    packet_t *tempLastAck = lastAcknowledged;
+    packet_t *tempLastAck = lastAcknowledged->packet;
     while(recAckNo > tempLastAck->ackno){
       tempLastAck = tempLastAck->next;
       tempLastAck->prev = NULL;
@@ -274,20 +299,20 @@ rel_read (rel_t *s)
 
       if(s->sendingWindow->mostRecentAdd == NULL){
         newPacket->seqno = 0;
-        s->sendingWindow->mostRecentAdd = newPacket;
+        s->sendingWindow->mostRecentAdd->packet = newPacket;
       }
       else{
-        newPacket->seqno = s->mostRecentAdd->seqno + 1;
+        newPacket->seqno = s->mostRecentAdd->packet->seqno + 1;
       }
       
       newPacket->len = strln(buffer) + sizeof(packet_t); //TODO: maybe subtract 500 for data built in
       strcpy(newPacket->data, buffer);
       
       //TODO: make this a method
-      s->sendingWindow->mostRecentAdd->next = newPacket;
+      s->sendingWindow->mostRecentAdd->packet->next = newPacket;
       newPacket->prev = s->sendingWindow->mostRecentAdd;
-      s->sendingWindow->mostRecentAdd = newPacket;
-      s->sendingWindow->lastSent = newPacket;
+      s->sendingWindow->mostRecentAdd->packet = newPacket;
+      s->sendingWindow->lastSent->packet = newPacket;
 
       conn_sendpkt(s->c, newPacket, newPacket->len);
     }
@@ -341,5 +366,26 @@ void
 rel_timer ()
 {
   /* Retransmit any packets that need to be retransmitted */
+  struct rel_session *sessionTemp = sessionList;
+  while(sessionTemp->next != NULL){
+    struct rel_session *packetWrapperTemp = sessionTemp->sendingWindow;
+    while(packetWrapperTemp->lastAcknowledged != packetWrapperTemp->lastSent){
+      if(packetWrapperTemp->lastAcknowledged->transmissionTimeoutNum %5 == 0){
+        //TODO: RETRANSMIT
+        packetWrapperTemp->lastAcknowledged->transmissionTimeoutNum = 0;
+      }
+      else{
+        packetWrapperTemp->lastAcknowledged->transmissionTimeoutNum += 1;
+      }
+      //TODO: MOVE POINTER
+      packetWrapperTemp->lastAcknowledged
+    }
+    //TODO: MOVE POINTER
+    temp->next
+  }
+
+
+
+
 
 }
