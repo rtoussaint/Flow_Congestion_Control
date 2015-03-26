@@ -62,14 +62,14 @@ len, seqno, ackno use BIG ENDIAN
  */
 
 #define MAX_BUFFER_SIZE 2000 //TODO: change this value
-
+#define MAX_PACKET_SIZE 1016;
 
 //TODO: finish wrapper struct
 typedef struct {
   packet_t *packet;
   struct packet_wrapper *next;
   struct packet_wrapper *prev;
-  int transmissionTimeoutNum;
+  int clockTimeLastSent;
 } packet_wrapper;
 
 
@@ -82,6 +82,7 @@ typedef struct {
 
 typedef struct {
   packet_wrapper *lastFrameReceived;
+  packet_wrapper *nextPacketToWrite;
   int largestAcceptableFrame;
   int bufferSize;
 } sliding_window_receiver_buffer;
@@ -92,6 +93,8 @@ struct reliable_state {
   rel_t **prev;
 
   conn_t *c;      /* This is the connection object */
+
+  struct config_common *cc;
 
   /* Add your own data fields below this */
   sliding_window_sender_buffer *sendingWindow;
@@ -150,6 +153,7 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 
   /* Do any other initialization you need here */
   addSessionToSessionList(r);
+  r->cc = cc;
 
   return r;
 }
@@ -227,7 +231,7 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
       lastReceivedPacket->packet = pkt;
 
       //TODO: Calculate Window Size
-      r->receivingWindow->largestAcceptableFrame = pkt->seqno + WINDOWSIZE; //How do we get window size!?!
+      r->receivingWindow->largestAcceptableFrame = pkt->seqno + r->cc->window; //How do we get window size!?!
     }
     else { //Receiving Window Exists
 
@@ -256,6 +260,7 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
         }
 
         //Send Ack for updates
+        //TODO: abstract to a method
         struct ack_packet *ack = (struct ack_packet*) malloc(sizeof(struct ack_packet));
         ack->cksum = 0; //TODO: Implement Checksum
         ack->len = 12;
@@ -291,7 +296,7 @@ rel_read (rel_t *s)
       packet_wrapper newPacketWrapper = (packet_wrapper*) malloc(sizeof(packet_wrapper));
       packet_t *newPacket = (packet_t*) malloc(sizeof(packet_t));
       newPacketWrapper->packet = newPacket;
-      newPacketWrapper->transmissionTimeoutNum = 0;
+      newPacketWrapper->clockTimeLastSent = clock_gettime();
 
       if(s->sendingWindow->mostRecentAdd == NULL){
         newPacket->seqno = 0;
@@ -335,18 +340,33 @@ rel_read (rel_t *s)
 void
 rel_output (rel_t *r)
 {
-  size_t availableSpace = conn_bufspace(r->c);
-  size_t bytesWritten = 0;
-  rel_t data = r->c->rel;
+  int availableSpace = conn_bufspace(r->c);
+  int size = r->receivingWindow->bufferSize;
+  packet *packetToWrite = r->receivingWindow->nextPacketToWrite;
+  while(availableSpace > MAX_PACKET_SIZE) {
+    char buffer[size];
+    //TODO: use packetToWrite and send that output -- why are we using r->c
+    //WEDNESDAY
+    conn_output(r->c, buffer, MAX_PACKET_SIZE);
+    availableSpace -= MAX_PACKET_SIZE;
 
-//  while(__Bytes still to write ____ && (bytesWritten < availableSpace)){
-//    //int conn_output (conn_t *c, const void *_buf, size_t _n)
-//    conn_output(connection)
-//
-//            bytesWritten += _____Bytes in packet____;
-//  }
+    //Send Ack for updates
+    struct ack_packet *ack = (struct ack_packet*) malloc(sizeof(struct ack_packet));
+    ack->cksum = 0; //TODO: Implement Checksum
+    ack->len = 12;
+    ack->ackno = packetToWrite->packet->seqno + 1;
+    conn_sendpkt(r->c, ack, ack->len);
 
 
+    if(packetToWrite != r->lastFrameReceived){
+      packet_wrapper temp = packetToWrite->next;
+      free(packetToWrite);
+      packetToWrite = temp;
+    }
+    else{
+      break;
+    }
+  }
 }
 
 
@@ -365,13 +385,11 @@ rel_timer ()
   rel_t *sessionTemp = sessionList;
   while(sessionTemp->next != NULL){
     packet_wrapper *packetWrapperTemp = sessionTemp->sendingWindow->lastAcknowledged;
-    while(packetWrapperTemp != sessionTemp->sendingWindow->lastSent){
-      if(packetWrapperTemp->transmissionTimeoutNum == 5){ //timeout
+    int current_time = clock_gettime();
+    while(packetWrapperTemp != sessionTemp->sendingWindow->lastSent->next){
+      if((current_time - packetWrapperTemp->clockTimeLastSent) > sessionTemp->cc->timeout){ //timeout
         conn_sendpkt(sessionTemp->c, packetWrapperTemp->packet, packetWrapperTemp->packet->len);
-        packetWrapperTemp->transmissionTimeoutNum = 0;
-      }
-      else{
-        packetWrapperTemp->transmissionTimeoutNum += 1;
+        packetWrapperTemp->clockTimeLastSent = current_time;
       }
       packetWrapperTemp = packetWrapperTemp->next;
     }
