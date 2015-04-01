@@ -2,6 +2,7 @@
 #include <dmalloc.h>
 #endif /* DMALLOC */
 
+#include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
 #include <sys/types.h>
