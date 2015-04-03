@@ -155,6 +155,11 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 	r->receivingWindow = (sliding_window_receiver_buffer*) malloc(sizeof(sliding_window_receiver_buffer));
 	r->sendingWindow = (sliding_window_sender_buffer*) malloc(sizeof(sliding_window_sender_buffer));
 
+	memset(r->receivingWindow, 0, sizeof(sliding_window_receiver_buffer));
+	memset(r->sendingWindow, 0, sizeof(sliding_window_sender_buffer));
+
+	r->receivingWindow->largestAcceptableFrame = cc->window;
+
 	return r;
 }
 
@@ -328,12 +333,19 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
  * 
  * When ACKS are received later and space becomes available in window, call rel_read again
  */
+char buffer[1000];
+
 void
 rel_read (rel_t *s)
 {
-	char buffer[1000];
 	while(1){
-		int conn_stdin_value = conn_input(s->c, buffer, 1000);
+		memset(buffer, 0, 1000);
+
+		// int conn_stdin_value = conn_input(s->c, buffer, 1000);
+		int conn_stdin_value = 1;
+		strcpy(buffer, "hello");
+
+		printf("1. %s\n", buffer);
 
 		if(conn_stdin_value == 0){ //no data read so break out of loop.
 			break;
@@ -412,11 +424,11 @@ rel_timer ()
 	while(sessionTemp != NULL){
 		packet_wrapper *packetWrapperTemp = sessionTemp->sendingWindow->firstUnackedPacket;
 
-		struct timespec *currentTime = NULL;
-		clock_gettime(CLOCK_MONOTONIC, currentTime);
+		struct timespec currentTime;
+		clock_gettime(CLOCK_MONOTONIC, &currentTime);
 
 		while(packetWrapperTemp != NULL){
-			if(1000*(currentTime->tv_sec - packetWrapperTemp->timeLastSent->tv_sec) > sessionTemp->timeout){ //timeout
+			if(1000*(currentTime.tv_sec - packetWrapperTemp->timeLastSent->tv_sec) > sessionTemp->timeout){ //timeout
 				conn_sendpkt(sessionTemp->c, packetWrapperTemp->packet, packetWrapperTemp->packet->len);
 				clock_gettime(CLOCK_MONOTONIC, packetWrapperTemp->timeLastSent);
 			}
