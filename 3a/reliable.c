@@ -333,19 +333,27 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
  * 
  * When ACKS are received later and space becomes available in window, call rel_read again
  */
-char buffer[1000];
+char buffer[500];
 
 void
 rel_read (rel_t *s)
 {
-	while(1){
-		memset(buffer, 0, 1000);
+	int conn_stdin_value;
+	packet_wrapper *newPacketWrapper;
+	packet_t *newPacket;
 
-		// int conn_stdin_value = conn_input(s->c, buffer, 1000);
-		int conn_stdin_value = 1;
+	while(1){
+		memset(buffer, 0, 500);
+
+		printf("random\n");
+
+		conn_stdin_value = conn_input(s->c, buffer, 500);
+		conn_stdin_value = 1;
+		memset(buffer, 0, 500);
 		strcpy(buffer, "hello");
 
 		printf("1. %s\n", buffer);
+		printf("2. %d\n", conn_stdin_value);
 
 		if(conn_stdin_value == 0){ //no data read so break out of loop.
 			break;
@@ -356,12 +364,13 @@ rel_read (rel_t *s)
 		}
 		else {
 			//TODO impose sending window size
-			packet_wrapper *newPacketWrapper = (packet_wrapper*) malloc(sizeof(packet_wrapper));
-			packet_t *newPacket = (packet_t*) malloc(sizeof(packet_t));
+			newPacketWrapper = (packet_wrapper*) malloc(sizeof(packet_wrapper));
+			newPacket = (packet_t*) malloc(sizeof(packet_t));
 			newPacketWrapper->packet = newPacket;
+			newPacketWrapper->timeLastSent = (struct timespec *) malloc(sizeof(struct timespec));
 			clock_gettime(CLOCK_MONOTONIC, newPacketWrapper->timeLastSent);
 			newPacket->len = 1016;
-			strncpy(newPacket->data, buffer, 1000);
+			strncpy(newPacket->data, buffer, 500);
 
 			if(s->sendingWindow->mostRecentAdd == NULL){
 				newPacket->seqno = 1;
