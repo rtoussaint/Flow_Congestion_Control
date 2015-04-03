@@ -15,7 +15,7 @@
 
 #include "rlib.h"
 
-
+uint32_t min(int a, int b);
 
 struct reliable_state {
 	rel_t *next;			/* Linked list for traversing all connections */
@@ -24,13 +24,15 @@ struct reliable_state {
 	conn_t *c;			/* This is the connection object */
 
 	/* Add your own data fields below this */
-	uint32_t congestion_window_size;
-	int eof_sent;
+	struct config_common *cc;
+	uint32_t CongestionWindow;
+	uint32_t MaxWindow;
+	uint32_t EffectiveWindow;
+	uint32_t ssthresh;
 };
 rel_t *rel_list;
 
-
-packet_t *eof = (packet_t *) xmalloc(sizeof(packet_t));
+packet_t *eof;
 
 /* Creates a new reliable protocol session, returns NULL on failure.
  * Exactly one of c and ss should be NULL.  (ss is NULL when called
@@ -57,7 +59,8 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 	rel_list = r;
 
 	/* Do any other initialization you need here */
-
+	r->cc = cc;
+	r->CongestionWindow = 1;
 
 	return r;
 }
@@ -82,6 +85,9 @@ rel_demux (const struct config_common *cc,
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
+	uint32_t AdvertisedWindow = pkt->rwnd;
+	r->MaxWindow = min(r->CongestionWindow, AdvertisedWindow);
+
 }
 
 
@@ -89,21 +95,25 @@ void
 rel_read (rel_t *s)
 {
 	if (!eof) {
+		eof = (packet_t *) xmalloc(sizeof(packet_t));
 		eof->rwnd = 0;
 		eof->seqno = 0;
 		eof->len = 12;
 	}
 
+	//if already sent EOF to the sender
+	//  return;
+	//else
+	//  send EOF to the sender
 	if(s->c->sender_receiver == RECEIVER)
 	{
 		if (s->eof_sent)
 			return;
 		else
+		{
 			conn_sendpkt(s->c, eof, 12);
-		//if already sent EOF to the sender
-		//  return;
-		//else
-		//  send EOF to the sender
+			s->eof_sent = 1;
+		}
 	}
 	else //run in the sender mode
 	{
@@ -119,6 +129,12 @@ rel_output (rel_t *r)
 void
 rel_timer ()
 {
-	/* Retransmit any packets that need to be retransmitted */
+	  /* Retransmit any packets that need to be retransmitted */
 
+
+}
+
+uint32_t
+min(int a, int b) {
+	return (a < b) ? a : b;
 }
