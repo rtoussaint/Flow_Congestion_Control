@@ -69,6 +69,7 @@ typedef struct sliding_window_sender_buffer {
 	packet_wrapper *firstUnackedPacket; //head of the list, has not been acked yet...once acked, it is freed.
 	packet_wrapper *mostRecentAdd;
 	int nextSeqno;
+	int eofReached; //initialized to 0 and then set to 1 when EOF reached.
 } sliding_window_sender_buffer;
 
 
@@ -82,6 +83,7 @@ typedef struct sliding_window_receiver_buffer{
 	packet_wrapper *firstUnwrittenPacket;
 	int nextSeqnoToWrite;
 	int largestAcceptableFrame;
+	int eofReceived; //starts at 0 and becomes 1 when an EOF is received from the other node.
 } sliding_window_receiver_buffer;
 
 
@@ -140,7 +142,9 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 
 	r->receivingWindow->largestAcceptableFrame = cc->window;
 	r->receivingWindow->nextSeqnoToWrite = 1;
+	r->receivingWindow->eofReceived = 0;
 	r->sendingWindow->nextSeqno = 1;
+	r->sendingWindow->eofReached = 0;
 	r->timeout = cc->timeout;
 	r->receiver_window_size = cc->window;
 	return r;
@@ -230,9 +234,15 @@ void sendDataAcknowledgement(rel_t *r) {
 			ackPacket->cksum = cksum(ackPacket, ackPacket->len);
 			ackPacket->ackno = temp->packet->seqno + 1;
 			conn_sendpkt(r->c, ackPacket, ackPacket->len);
-//			printf("Sending ack for packet %d\n", ackPacket->ackno - 1);
+			//			printf("Sending ack for packet %d\n", ackPacket->ackno - 1);
 			break;
 		}
+	}
+}
+
+void destroyOnConditionsSatisfied(rel_t *r) {
+	if(r->sendingWindow->mostRecentAdd == NULL && r->sendingWindow->eofReached == 1 && r->receivingWindow->eofReceived) {
+		rel_destroy(r);
 	}
 }
 
@@ -252,10 +262,12 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 			temp = nextPacket;
 		}
 		r->sendingWindow->firstUnackedPacket = temp;
+
+		destroyOnConditionsSatisfied(r); //its possible that all packets have now been acked.
 	}
-	else if(pkt->len == 12) { //handle EOF = WHAT MAKES EOF!!!!???
-		//TODO see if more needs to be done here.
-		rel_destroy(r);
+	else if(pkt->len == 12) { //Received EOF from the other node.
+		r->receivingWindow->eofReceived = 1;
+		destroyOnConditionsSatisfied(r);
 	}
 	else {
 
@@ -335,19 +347,26 @@ rel_read (rel_t *s)
 		memset(buffer, 0, MAX_PACKET_SIZE);
 		conn_stdin_value = conn_input(s->c, buffer, MAX_PACKET_SIZE);
 
-//		memset(buffer, 0, MAX_PACKET_SIZE);
-//		strcpy(buffer, "hello world");
-//		conn_stdin_value = 11;
-//		if(count == 1) {
-//			break;
-//		}
-//		count++;
+		//		memset(buffer, 0, MAX_PACKET_SIZE);
+		//		strcpy(buffer, "hello world");
+		//		conn_stdin_value = 11;
+		//		if(count == 1) {
+		//			break;
+		//		}
+		//		count++;
 
 		if(conn_stdin_value == 0){ //no data read so break out of loop.
 			break;
 		}
 		else if(conn_stdin_value == -1) { //EOF read so tear down connection.
-			rel_destroy(s);
+			newPacketWrapper = (packet_wrapper*) malloc(sizeof(packet_wrapper));
+			memset(newPacketWrapper, 0, sizeof(packet_wrapper));
+			newPacket = (packet_t*) malloc(sizeof(packet_t));
+			newPacket->len = 12;
+			conn_sendpkt(s->c, newPacket, newPacket->len);
+
+			s->sendingWindow->eofReached = 1;
+			destroyOnConditionsSatisfied(s);
 			break;
 		}
 		else {
@@ -360,7 +379,7 @@ rel_read (rel_t *s)
 			newPacketWrapper->timeLastSent = (struct timespec *) malloc(sizeof(struct timespec));
 			clock_gettime(CLOCK_MONOTONIC, newPacketWrapper->timeLastSent);
 			newPacket->len = 516;
-			strncpy(newPacket->data, buffer, conn_stdin_value);
+			strncpy(newPacket->data, buffer, 30);
 			newPacket->seqno = s->sendingWindow->nextSeqno;
 			newPacket->cksum = cksum(newPacket, newPacket->len);
 
@@ -373,7 +392,7 @@ rel_read (rel_t *s)
 				newPacketWrapper->prev = s->sendingWindow->mostRecentAdd;
 				s->sendingWindow->mostRecentAdd = newPacketWrapper;
 			}
-//			printf("Sending data packet %d\n", newPacket->seqno);
+			//			printf("Sending data packet %d\n", newPacket->seqno);
 			conn_sendpkt(s->c, newPacket, newPacket->len);
 		}
 	}
