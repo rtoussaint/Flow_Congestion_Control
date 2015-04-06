@@ -157,7 +157,6 @@ rel_destroy (rel_t *r)
 	*r->prev = r->next;
 	conn_destroy (r->c);
 
-
 	free(r->sWindow);
 	free(r->rWindow);
 	free(r);
@@ -323,7 +322,6 @@ rel_read (rel_t *s) {
 	int conn_stdin_value;
 	packet_wrapper* newWrapper;
 	packet_t* packetToSend;
-	int count = 0;
 
 	while(!isSendingWindowFull(s) && s->sState == SENDING) {
 		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
