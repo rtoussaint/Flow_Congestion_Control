@@ -1,5 +1,5 @@
-
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -12,128 +12,106 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
-
 #include "rlib.h"
 
-/*
-SENDER:
-- Read in a file generated, break it into 1000 byte packets, add a control hearder to packet
-- Send file to the receiver through congested link
-- Print out the amount of time to transfer the file
-  - start time = at rel_init()  <-- use clock_gettime()
-  - finish time = at rel_destroy()
 
+#define MAX_PAYLOAD_SIZE 500
+#define EOF_PACKET_SIZE 12
+#define DATA_PACKET_SIZE 512
+#define ACK_PACKET_SIZE 8
+#define DATA_PACKET_HEADER_SIZE 12
 
-
-RECEIVER:
-- Read the packets being send
-- Write data to output file
- **Make sure that the file received is identical to the file sent**
-^^use diff to check this
-- Send ACKs back
-
-
-
-Relayer = bottleneck of the network (multiple hosts trying to send across)
-- set parameters in config.xml
-
-Congestion Control Algorithm = TCP-Reno (slow-start and congestion avoidance)
-
-
-
-PACKET INFORMATION:
-You can tell ACK from Data packet by the size
-ACK size = 12 bytes
-Data size = 16 - 1016 bytes
-
-len, seqno, ackno use BIG ENDIAN 
-^^Use htonl/htons for WRITES
-^^Use ntohl/ntohs for READS
-
- */
-
-
-
-
-/* AT THE BEGINNING OF THE PROGRAM
-//TODO:
-1. receiver should send the sender an EOF to tell the sender that it does not have any data to send
-  - consider using conn_sendpkt() in rlib.c
- */
-
-#define MAX_BUFFER_SIZE 2000 //TODO: change this value
-
-/**
- * Packet wrapper structure that contains the packet, pointers to the previous
- * and next packet, and the time the packet was last transmitted.
- */
-typedef struct packet_wrapper {
-	packet_t *packet;
-	struct packet_wrapper *next;
-	struct packet_wrapper *prev;
-	struct timespec *timeLastSent;
-} packet_wrapper;
-
-/**
- * The sender sliding window starts with the last acknowledged packet.
- * It also features the last sent packet and the packet that was most recently
- * added from the buffer (using conn_input).
- */
-typedef struct sliding_window_sender_buffer {
-	packet_wrapper *firstUnackedPacket; //head of the list, has not been acked yet...once acked, it is freed.
-	packet_wrapper *mostRecentAdd;
-} sliding_window_sender_buffer;
-
-/**
- * The receiver sliding window begins with the last frame received. This
- * packet has not been written yet. The largest Acceptable frame is the
- * maximum packet seqno for which the packet can be added to the receiver
- * sliding window.
- */
-typedef struct sliding_window_receiver_buffer{
-	packet_wrapper *firstUnwrittenPacket;
-	int largestAcceptableFrame;
-} sliding_window_receiver_buffer;
-
-
-/**
- * rel_t is a wrapper around a connection. We added a receiver_window_size which
- * represents the maximum number of packets that can be present in the receiving
- * window. The structure also contains a sending window and receiving window as
- * well as a pointer cc to the config_common structure which has general information
- * about the program and connections.
- */
-struct reliable_state {
-	rel_t *next;			/* Linked list for traversing all connections */
-	rel_t **prev;
-
-	conn_t *c;			/* This is the connection object */
-
-	int receiver_window_size;
-	int timeout;
-	sliding_window_sender_buffer *sendingWindow;
-	sliding_window_receiver_buffer *receivingWindow;
+enum senderState {
+	SENDING, WAITING_FOR_EOF_ACK, SENDER_DONE
+};
+enum receiverState {
+	RECEIVING, RECEIVER_DONE
 };
 
 
-//Linked list of reliable state sessions.
+typedef struct packet_wrapper {
+	struct timespec timeSent;
+	struct packet_wrapper *next;
+	packet_t *pkt;
+} packet_wrapper;
+
+typedef struct send_buffer {
+	uint32_t max_size;
+	uint32_t next_seqno;
+	packet_wrapper *head;
+	packet_wrapper *tail;
+} send_buffer;
+
+typedef struct recv_buffer {
+	uint32_t max_size;
+	uint32_t next_expected;
+	packet_wrapper *head;
+	packet_wrapper *tail;
+} recv_buffer;
+
+
+struct reliable_state {
+	rel_t *next;
+	rel_t **prev;
+	conn_t *c;
+
+	int receiver_window_size;
+	int timeout;
+
+	send_buffer *sWindow;
+	enum senderState sState;
+
+
+	recv_buffer *rWindow;
+	enum receiverState rState;
+};
+
+
+
+
+
+void changePacketToHostByteOrder (packet_t *pkt) {
+	if(pkt->seqno)
+		pkt->seqno = ntohl (pkt->seqno);
+	pkt->len = ntohs (pkt->len);
+	pkt->ackno = ntohl (pkt->ackno);
+}
+
+void changePacketToNetworkByteOrder (packet_t *pkt) {
+	if(pkt->seqno)
+		pkt->seqno = htonl (pkt->seqno);
+	pkt->len = htons (pkt->len);
+	pkt->ackno = htonl (pkt->ackno);
+}
+
+void sendDataAcknowledgement(rel_t *r, uint32_t ackno) {
+	struct ack_packet *ackPacket;
+	ackPacket = xmalloc (ACK_PACKET_SIZE);
+	memset((void*) ackPacket, 0, ACK_PACKET_SIZE);
+	ackPacket->len = (uint16_t) ACK_PACKET_SIZE;
+	ackPacket->ackno = (uint32_t) ackno;
+
+	changePacketToNetworkByteOrder((packet_t*) ackPacket);
+	ackPacket->cksum = cksum(ackPacket, ACK_PACKET_SIZE);
+	conn_sendpkt(r->c, (packet_t*) ackPacket, ACK_PACKET_SIZE);
+	free(ackPacket);
+}
+
+bool isSendingWindowFull(rel_t *r) {
+	return r->sWindow->head != NULL && (r->sWindow->tail->pkt->seqno - r->sWindow->head->pkt->seqno) >= r->sWindow->max_size;
+}
+
+
+//Global list of reliable states.
 rel_t *rel_list;
 
 
-
-/* Creates a new reliable protocol session, returns NULL on failure.
- * Exactly one of c and ss should be NULL.  (ss is NULL when called
- * from rlib.c, while c is NULL when this function is called from
- * rel_demux.) */
-rel_t *
-rel_create (conn_t *c, const struct sockaddr_storage *ss,
+rel_t * rel_create (conn_t *c, const struct sockaddr_storage *ss,
 		const struct config_common *cc)
 {
 	rel_t *r;
-
 	r = xmalloc (sizeof (*r));
 	memset (r, 0, sizeof (*r));
-
 	if (!c) {
 		c = conn_create (r, ss);
 		if (!c) {
@@ -141,8 +119,6 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 			return NULL;
 		}
 	}
-
-
 	r->c = c;
 	r->next = rel_list;
 	r->prev = &rel_list;
@@ -150,45 +126,29 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 		rel_list->prev = &r->next;
 	rel_list = r;
 
+
+	//Initialize session state.
 	r->timeout = cc->timeout;
 	r->receiver_window_size = cc->window;
-	r->receivingWindow = (sliding_window_receiver_buffer*) malloc(sizeof(sliding_window_receiver_buffer));
-	r->sendingWindow = (sliding_window_sender_buffer*) malloc(sizeof(sliding_window_sender_buffer));
 
-	memset(r->receivingWindow, 0, sizeof(sliding_window_receiver_buffer));
-	memset(r->sendingWindow, 0, sizeof(sliding_window_sender_buffer));
 
-	r->receivingWindow->largestAcceptableFrame = cc->window;
+	r->sWindow = (send_buffer *) xmalloc(sizeof(send_buffer));
+	memset(r->sWindow, 0, sizeof(send_buffer));
+	r->sWindow->max_size = cc->window;
+	r->sWindow->next_seqno = 1;
+
+	r->rWindow = (recv_buffer *) xmalloc(sizeof(recv_buffer));
+	memset(r->rWindow, 0, sizeof(recv_buffer));
+	r->rWindow->next_expected = 1;
+	r->rWindow->max_size = cc->window;
+
+	r->sState = SENDING;
+	r->rState = RECEIVING;
 
 	return r;
 }
 
 
-/**
- * Free all the packets in a window. This function is called
- * in the rel_destroy function.
- */
-void free_packets_in_window(packet_wrapper *head) {
-	packet_wrapper *temp = head;
-	packet_wrapper *tempToFree;
-	while(temp != NULL) {
-		tempToFree = temp;
-		temp = temp->next;
-		free(tempToFree);
-	}
-}
-
-
-/* The library will call rel_destroy when it receives an ICMP port unreachable
- * Also called when ALL of the following hold:
- * 1. Read an EOF from the other side (a data packet with 0 bytes payload field)
- * 2. Read an EOF or error from the input (conn_input returned -1) 
- * 3. All packets you send have been acknowledged
- * 4. You have written all output data with conn_output
- *
- * One side must wait 2*MSS before destroying the connection (incase the last ACK gets lost)
- * both the sender and the receiver should be able to close the connection
- */
 void
 rel_destroy (rel_t *r)
 {
@@ -197,253 +157,254 @@ rel_destroy (rel_t *r)
 	*r->prev = r->next;
 	conn_destroy (r->c);
 
-	/* Free any other allocated memory here */
-	free_packets_in_window(r->sendingWindow->firstUnackedPacket); //free sending window packets.
-	free_packets_in_window(r->receivingWindow->firstUnwrittenPacket); //free receiving window packets.
-	free(r->receivingWindow);
-	free(r->sendingWindow);
 
-	//CONSIDER: conn_free() in rlib.c
+	free(r->sWindow);
+	free(r->rWindow);
+	free(r);
 }
 
 
-/* This function only gets called when the process is running as a
- * server and must handle connections from multiple clients.  You have
- * to look up the rel_t structure based on the address in the
- * sockaddr_storage passed in.  If this is a new connection (sequence
- * number 1), you will need to allocate a new conn_t using rel_create
- * ().  (Pass rel_create NULL for the conn_t, so it will know to
- * allocate a new connection.)
- *
- * Possibly not necessary for 3a or 3b!!!
- *
- */
 void
-rel_demux (const struct config_common *cc, const struct sockaddr_storage *ss, packet_t *pkt, size_t len)
-{
-	//	rel_t *state = rel_list;
-	//	while(state != NULL) {
-	//		if(addreq(ss, &(state->c->peer)) == 1) {
-	//			rel_recvpkt(state, pkt, len);
-	//			return;
-	//		}
-	//		state = state->next;
-	//	}
-	//	rel_create(NULL, ss, cc);
+rel_demux (const struct config_common *cc,
+		const struct sockaddr_storage *ss, packet_t *pkt, size_t len){ }
 
+
+bool
+isPacketChecksumInvalid(packet_t* pkt) {
+	int checksum = pkt->cksum;
+	memset (&(pkt->cksum), 0, sizeof (pkt->cksum));
+	return cksum(pkt, ntohs(pkt->len)) != checksum;
+}
+
+void destroyConnectionIfAppropriate(rel_t *r) {
+	if(r->sState == SENDER_DONE && r->rState == RECEIVER_DONE) {
+		rel_destroy(r);
+	}
+}
+
+bool isSendingWindowEmpty(rel_t *r) {
+	return r->sWindow->head == NULL;
 }
 
 
-/**
- * Sends an acknowledgment packet on the given reliable state session's connection.
- */
-void sendDataAcknowledgement(rel_t *r) {
-	packet_wrapper *temp = r->receivingWindow->firstUnwrittenPacket;
+bool isValidAckToBeHandled(rel_t* r, packet_t* pkt) {
+	return pkt->len == ACK_PACKET_SIZE &&				//The packet is actually an ack
+			!isSendingWindowEmpty(r) && 					//A packet exists to be acked.
+			r->sState != SENDER_DONE &&					//The sender has not received an ack for the EOF
+			ntohl(r->sWindow->head->pkt->seqno) < pkt->ackno;	//The ack acks the current packet in the sending window.
+}
+
+void handleAck(rel_t* r, packet_t *pkt) {
+	packet_wrapper *temp = r->sWindow->head;
+	while(temp != NULL && ntohl(temp->pkt->seqno) < pkt->ackno) {
+		r->sWindow->head = temp->next;
+		free(temp->pkt);
+		free(temp);
+		temp = r->sWindow->head;
+		if(temp == NULL) {
+			r->sWindow->tail = NULL;
+		}
+	}
+
+	if(r->sState == WAITING_FOR_EOF_ACK && isSendingWindowEmpty(r)) { //Done sending once all packets have been acked.
+		r->sState = SENDER_DONE;
+		destroyConnectionIfAppropriate(r);
+	} else {
+		rel_read(r);
+	}
+}
+
+bool isValidDataPacket(rel_t *r, packet_t* pkt) {
+	return r->rState == RECEIVING && 				//Have not received the EOF
+			pkt->seqno >= r->rWindow->next_expected &&		//There is not already an unacked packet in the sending window.
+			pkt->seqno <=  r->rWindow->next_expected + r->rWindow->max_size; 	//The data packet is the one we were expecting
+}
+
+void addinorder_recv(rel_t *r, packet_t *pkt)
+{
+	packet_wrapper *newWrapper;
+	newWrapper = (packet_wrapper*) xmalloc(sizeof(packet_wrapper));
+	memset(newWrapper, 0, sizeof(packet_wrapper));
+
+	packet_t *newPacket;
+	newPacket = (packet_t*) xmalloc(sizeof(packet_t));
+	memset(newPacket, 0, sizeof(packet_t));
+
+	memcpy(newPacket, pkt, sizeof(packet_t)); //SOURCE of possible error
+
+	newWrapper->pkt = newPacket;
+
+	packet_wrapper *temp = r->rWindow->head;
+
+	if(temp == NULL) {
+		r->rWindow->head = r->rWindow->tail = newWrapper;
+		return;
+	}
+	if(pkt->seqno < temp->pkt->seqno) {
+		newWrapper->next = temp;
+		r->rWindow->head = newWrapper;
+		return;
+	}
 
 	while(temp != NULL) {
-		packet_wrapper *nextPacket  = temp->next;
-		if(nextPacket != NULL && temp->packet->seqno == nextPacket->packet->seqno - 1) {
-			temp = nextPacket;
-		} else {
-			packet_t *ackPacket = (packet_t*) malloc(sizeof(packet_t));
-			ackPacket->len = 12;
-			ackPacket->cksum = cksum(ackPacket, ackPacket->len);
-			ackPacket->ackno = temp->packet->seqno + 1;
-			conn_sendpkt(r->c, ackPacket, ackPacket->len);
+		packet_wrapper *next = temp->next;
+		if(temp->pkt->seqno == pkt->seqno) {
+			free(newWrapper);
 			break;
 		}
+		if(next == NULL) {
+			temp->next = newWrapper;
+			r->rWindow->tail = newWrapper;
+			break;
+		}
+		if(pkt->seqno < next->pkt->seqno) {
+			temp->next = newWrapper;
+			newWrapper->next = next;
+			break;
+		}
+		temp = temp->next;
 	}
 }
 
 
-/* This function is called by the library when a packet is received 
- * and supplied you with the packet
- */
+
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
-	if(pkt->len == 12 && pkt->ackno != 0){ //ACK
-		packet_wrapper *temp = r->sendingWindow->firstUnackedPacket; //head packet cannot be NULL - otherwise there would be no ACK
-		packet_wrapper *nextPacket;
-		while(temp->packet->seqno <= pkt->ackno - 1) {
-			nextPacket = temp->next;
-			free(temp);
-			temp = nextPacket;
-		}
-		r->sendingWindow->firstUnackedPacket = temp;
+	if((size_t) ntohs(pkt->len) != n || isPacketChecksumInvalid(pkt)) {
+		return;
 	}
 
-	else if(pkt->len == 12) {	//handle EOF = WHAT MAKES EOF!!!!???
-		//TODO see if more needs to be done here.
-		rel_destroy(r);
+	changePacketToHostByteOrder(pkt);
+
+	if(isValidAckToBeHandled(r, pkt)) {
+		handleAck(r, pkt);
 	}
-	else { //DATA
-
-		//Receiving Window
-		//		| LFR 	|	|	|	|	|  LAF	|
-		// Add new data packet to correct slot.
-
-
-		packet_wrapper *firstUnwrittenPacket = r->receivingWindow->firstUnwrittenPacket;
-		int largestAcceptableSeqNo = r->receivingWindow->largestAcceptableFrame;
-		if(firstUnwrittenPacket == NULL && pkt->seqno == 1){ //first data packet received.
-			//First packet in the link list (haven't seen a packet before this)
-			r->receivingWindow->firstUnwrittenPacket = (packet_wrapper*) malloc(sizeof(packet_wrapper));
-			r->receivingWindow->firstUnwrittenPacket->packet = pkt;
-		}
-		else if(firstUnwrittenPacket != NULL && pkt->seqno > firstUnwrittenPacket->packet->seqno && pkt->seqno <= largestAcceptableSeqNo) { //Receiving Window Exists
-			packet_wrapper *temp = firstUnwrittenPacket;
-			while(temp != NULL) {
-				packet_wrapper *next_packet = temp->next;
-				if(pkt->seqno == temp->packet->seqno) { //packet already exists.
-					break;
-				}
-				else if(next_packet == NULL) {
-					packet_wrapper *newPacket = (packet_wrapper*) malloc(sizeof(packet_wrapper));
-					temp->next = newPacket;
-					newPacket->prev = temp;
-					break;
-				}
-				else if(pkt->seqno < next_packet->packet->seqno) {	//next packet is not null in this case.
-					packet_wrapper *newPacket = (packet_wrapper*) malloc(sizeof(packet_wrapper));
-					newPacket->packet = pkt;
-					newPacket->prev = temp;
-					newPacket->next = next_packet;
-					temp->next = newPacket;
-					next_packet->prev = newPacket;
-					break;
-				}
-				else {
-					temp = temp->next;
-				}
-			}
-		}
-		sendDataAcknowledgement(r);
-		rel_output(r);	//write packets to standard output.
+	else if(isValidDataPacket(r, pkt)) {
+		addinorder_recv(r, pkt);
+		rel_output(r);
 	}
 }
 
-/* To get the data that you need inorder to send, keep calling conn_input
- * --> int conn_input (conn_t *c, void *buf, size_t n)
- *
- * If conn_input returns 0, return from rel_read (do not loop)
- * When data becomes available at a later moment, the libary will call rel_read ONCE
- *
- * When SENDER buffer becomes full, break from the loop (even if more data is available from conn_input)
- * 
- * When ACKS are received later and space becomes available in window, call rel_read again
- */
-char buffer[500];
+
+void sendDataPacket(rel_t* r, packet_wrapper* wrapper) {
+	clock_gettime(CLOCK_MONOTONIC, &wrapper->timeSent);
+	conn_sendpkt(r->c, wrapper->pkt, ntohs (wrapper->pkt->len));
+}
+
+
+void buildPacket(rel_t *r, int bytes, packet_t *pkt) {
+	packet_wrapper *tail = r->sWindow->tail;
+	pkt->seqno = (tail) ? (uint32_t) (tail->pkt->seqno + 1) : (uint32_t) r->sWindow->next_seqno;
+	pkt->len = (uint16_t) ((bytes == -1) ? EOF_PACKET_SIZE : DATA_PACKET_HEADER_SIZE + bytes);
+	pkt->ackno = 0;
+	changePacketToNetworkByteOrder(pkt);
+
+	pkt->cksum = cksum(pkt, ntohs(pkt->len));
+}
+
+packet_wrapper* add_end_to_s_window(rel_t *r, packet_t *pkt) {
+	packet_wrapper *newWrapper;
+	newWrapper = (packet_wrapper*) xmalloc(sizeof(packet_wrapper));
+	memset(newWrapper, 0, sizeof(*newWrapper));
+	newWrapper->pkt = pkt;
+	if(r->sWindow->head == NULL) {
+		r->sWindow->head = r->sWindow->tail = newWrapper;
+	} else {
+		r->sWindow->tail->next = newWrapper;
+		r->sWindow->tail = newWrapper;
+	}
+	return newWrapper;
+}
+
 
 void
-rel_read (rel_t *s)
-{
+rel_read (rel_t *s) {
 	int conn_stdin_value;
-	packet_wrapper *newPacketWrapper;
-	packet_t *newPacket;
+	packet_wrapper* newWrapper;
+	packet_t* packetToSend;
+	int count = 0;
 
-	while(1){
-		memset(buffer, 0, 500);
+	while(!isSendingWindowFull(s) && s->sState == SENDING) {
+		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
+		memset(packetToSend, 0, sizeof(packet_t));
 
-		printf("random\n");
+		conn_stdin_value = conn_input(s->c, packetToSend->data, MAX_PAYLOAD_SIZE);
 
-		conn_stdin_value = conn_input(s->c, buffer, 500);
+		memset(packetToSend->data, 0, sizeof(packetToSend->data));
+		strcpy(packetToSend->data, "hello world");
 		conn_stdin_value = 1;
-		memset(buffer, 0, 500);
-		strcpy(buffer, "hello");
-
-		printf("1. %s\n", buffer);
-		printf("2. %d\n", conn_stdin_value);
-
-		if(conn_stdin_value == 0){ //no data read so break out of loop.
-			break;
+		if(count == 1) {
+			conn_stdin_value = 0;
 		}
-		else if(conn_stdin_value == -1) { //EOF read so tear down connection.
-			rel_destroy(s);
-			break;
+		count++;
+
+		if(conn_stdin_value != 0) {
+			buildPacket(s, conn_stdin_value, packetToSend);
+			newWrapper = add_end_to_s_window(s, packetToSend);
+			sendDataPacket(s, newWrapper);
+			if(conn_stdin_value == -1) {
+				s->sState = WAITING_FOR_EOF_ACK;
+			}
+			s->sWindow->next_seqno += 1;
 		}
 		else {
-			//TODO impose sending window size
-			newPacketWrapper = (packet_wrapper*) malloc(sizeof(packet_wrapper));
-			newPacket = (packet_t*) malloc(sizeof(packet_t));
-			newPacketWrapper->packet = newPacket;
-			newPacketWrapper->timeLastSent = (struct timespec *) malloc(sizeof(struct timespec));
-			clock_gettime(CLOCK_MONOTONIC, newPacketWrapper->timeLastSent);
-			newPacket->len = 1016;
-			strncpy(newPacket->data, buffer, 500);
-
-			if(s->sendingWindow->mostRecentAdd == NULL){
-				newPacket->seqno = 1;
-				s->sendingWindow->mostRecentAdd = s->sendingWindow->firstUnackedPacket = newPacketWrapper;
-			}
-			else{
-				newPacket->seqno = s->sendingWindow->mostRecentAdd->packet->seqno + 1;
-				s->sendingWindow->mostRecentAdd->next = newPacketWrapper;
-				newPacketWrapper->prev = s->sendingWindow->mostRecentAdd;
-				s->sendingWindow->mostRecentAdd = newPacketWrapper;
-			}
-
-			conn_sendpkt(s->c, newPacket, newPacket->len);
-		}
-	}
-}
-
-
-
-
-/* This function is called by the library when output has drained 
- * Call conn_output, it writes to STDOUT
- * conn_bufspace is useful --> tells how much space is availale for use by conn_output
- * DO NOT WRITE MORE THAN conn_bufspace Bytes 
- * 
- * If you are unable to output certain bytes to STDOUT, do NOT ACK them back to the sender
- * If you have more bytes to output, wait until the library calls rel_out again and then 
- * call conn_bufspace to see how much additional space is available
- * 
- * Send more ACKS for the bytes that have been written to STDOUT
- * ^^ Sender will also send more data once ACKs are received 
- */
-void
-rel_output (rel_t *r)
-{
-	packet_wrapper *temp = r->receivingWindow->firstUnwrittenPacket;
-	while(temp != NULL && temp->next != NULL && conn_bufspace(r->c) > 1000) {
-		packet_wrapper *nextFrame = temp->next;
-		if(temp->packet->seqno == nextFrame->packet->seqno - 1) {
-			conn_output(r->c, temp->packet->data, strlen(temp->packet->data));
-			free(temp);
-			temp = nextFrame;
-		} else {
-			r->receivingWindow->firstUnwrittenPacket = temp;
-			r->receivingWindow->largestAcceptableFrame = temp->packet->seqno + r->receiver_window_size;
+			free(packetToSend);
 			break;
 		}
 	}
 }
 
 
-/*
- * Retransmit packets that timeout. Does not send ACKS!!!
- */
 void
-rel_timer ()
-{
-	/* Retransmit any packets that need to be retransmitted */
+rel_output (rel_t *r) {
+
+	packet_wrapper *temp = r->rWindow->head;
+	while(temp != NULL && temp->pkt->seqno == r->rWindow->next_expected) {
+		int bytesToWrite =  temp->pkt->len - DATA_PACKET_HEADER_SIZE;
+		if(conn_bufspace(r->c) > bytesToWrite) {
+			conn_output(r->c, temp->pkt->data, bytesToWrite);
+			r->rWindow->head = temp->next;
+
+			if(temp->pkt->len == EOF_PACKET_SIZE) {
+				r->rState = RECEIVER_DONE;
+				destroyConnectionIfAppropriate(r);
+			}
+
+			free(temp->pkt);
+			free(temp);
+			r->rWindow->next_expected += 1;
+		}
+		else {
+			break;
+		}
+		temp = r->rWindow->head;
+	}
+	sendDataAcknowledgement(r, r->rWindow->next_expected);
+}
+
+
+bool
+packetHasTimedOut(struct timespec timeLastTransmitted, int timeout) {
+	struct timespec currentTime;
+	clock_gettime(CLOCK_MONOTONIC, &currentTime);
+	return 1000*(currentTime.tv_sec - timeLastTransmitted.tv_sec) > timeout;
+}
+
+
+void
+rel_timer () {
 	rel_t *sessionTemp = rel_list;
 	while(sessionTemp != NULL){
-		packet_wrapper *packetWrapperTemp = sessionTemp->sendingWindow->firstUnackedPacket;
-
-		struct timespec currentTime;
-		clock_gettime(CLOCK_MONOTONIC, &currentTime);
-
-		while(packetWrapperTemp != NULL){
-			if(1000*(currentTime.tv_sec - packetWrapperTemp->timeLastSent->tv_sec) > sessionTemp->timeout){ //timeout
-				conn_sendpkt(sessionTemp->c, packetWrapperTemp->packet, packetWrapperTemp->packet->len);
-				clock_gettime(CLOCK_MONOTONIC, packetWrapperTemp->timeLastSent);
+		if(sessionTemp->sState != SENDER_DONE){
+			packet_wrapper* wrapper = sessionTemp->sWindow->head;
+			while(wrapper != NULL) {
+				if(packetHasTimedOut(wrapper->timeSent, sessionTemp->timeout)) {
+					sendDataPacket(sessionTemp, wrapper);
+				}
+				wrapper = wrapper->next;
 			}
-			packetWrapperTemp = packetWrapperTemp->next;
 		}
-
 		sessionTemp = sessionTemp->next;
 	}
 }
