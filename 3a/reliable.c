@@ -98,7 +98,7 @@ void sendDataAcknowledgement(rel_t *r, uint32_t ackno) {
 }
 
 bool isSendingWindowFull(rel_t *r) {
-	return r->sWindow->head != NULL && (r->sWindow->tail->pkt->seqno - r->sWindow->head->pkt->seqno) >= r->sWindow->max_size;
+	return r->sWindow->head != NULL && (ntohl(r->sWindow->tail->pkt->seqno) - ntohl(r->sWindow->head->pkt->seqno)) >= r->sWindow->max_size;
 }
 
 
@@ -295,7 +295,7 @@ void sendDataPacket(rel_t* r, packet_wrapper* wrapper) {
 
 void buildPacket(rel_t *r, int bytes, packet_t *pkt) {
 	packet_wrapper *tail = r->sWindow->tail;
-	pkt->seqno = (tail) ? (uint32_t) (tail->pkt->seqno + 1) : (uint32_t) r->sWindow->next_seqno;
+	pkt->seqno = (tail) ? (uint32_t) ntohl(tail->pkt->seqno) + 1 : (uint32_t) r->sWindow->next_seqno;
 	pkt->len = (uint16_t) ((bytes == -1) ? EOF_PACKET_SIZE : DATA_PACKET_HEADER_SIZE + bytes);
 	pkt->ackno = 0;
 	changePacketToNetworkByteOrder(pkt);
@@ -328,16 +328,7 @@ rel_read (rel_t *s) {
 	while(!isSendingWindowFull(s) && s->sState == SENDING) {
 		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
 		memset(packetToSend, 0, sizeof(packet_t));
-
 		conn_stdin_value = conn_input(s->c, packetToSend->data, MAX_PAYLOAD_SIZE);
-
-		memset(packetToSend->data, 0, sizeof(packetToSend->data));
-		strcpy(packetToSend->data, "hello world");
-		conn_stdin_value = 1;
-		if(count == 1) {
-			conn_stdin_value = 0;
-		}
-		count++;
 
 		if(conn_stdin_value != 0) {
 			buildPacket(s, conn_stdin_value, packetToSend);
