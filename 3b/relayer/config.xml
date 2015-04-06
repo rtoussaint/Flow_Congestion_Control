@@ -16,7 +16,64 @@
 <bandwidth>10000</bandwidth>
 
 <!-- buffer size in number of packets, delay bandwidth product is recommended, RTT * bandwidth -->
+<!-- ADDED: The buffer size is usually configured to be the delay bandwidth product. -->
+<!-- ADDED: When the buffer is full, the router begins to discard packets using the FIFO policy. -->
 <buffer_size>25</buffer_size>
+
+
+
+<!-- ADDED: *************************** ADDITIONAL NOTES  **************************
+        RELAYER NOTES:
+          Relayer will NOT drop acknowledgment's packets 
+          Relayer CAN drop data packets from the SENDER, if the buffer is full (can also delay packets)
+
+        CPU Frequency -- Configuration Paraemeter = <CPU_frequency> :
+          You can type "cat /porc/cpuinfo" to find out this configuration
+
+        Logs -- Config Paramter = <enable_log>:
+          - 0 to disable packet log
+          - 1 to enable packet log
+          - ** Note that this may interfere with the program's packet transmission time **
+
+        TESTING:
+          - the -r option is used for RECEIVER MODE
+          - RECEIVER CAN ONLY SEND ACKS BACK TO THE SENDER
+          - the -s option is used for SENDER MODE
+          - Window size for the SENDER is optional to denote on the command line
+          - IMPORTANT:
+              - For config.xml file, you can only modify CPU frequency, senders and receivers IP addresses and ports. You SHOULD NOT change propagation delay (20 ms) , bandwidth (10 Mb /s) and buffer size (25 packets).
+
+          - Data packets are 16-1016 bytes
+
+        RECEIVER MODE:
+          - should send an EOF to the sender at the very beginning to tell the sender that the receiver has no data to send
+
+        SENDER MODE:
+          - The sender should print out the amount of time to transfer a file
+          - Start Time = @ rel_init() being called
+          - End Time = @ rel_destroy() being called
+          - ** "We will use this timer difference to evaluate your implementation." -- according to the assignment page **
+
+        ACK PACKETS:
+          - ACK packet are 12 bytes
+          - ACKs can ONLY be sent by the RECEIVER
+          - ACKs contain: cksum, len, ackno, and rwnd fields ONLY
+          - See new packet_t struct below
+
+
+        NEW PACKET STRUCTURE:
+
+            struct packet {
+              uint16_t cksum; /* Ack and Data */
+              uint16_t len;   /* Ack and Data */
+              uint32_t ackno; /* Ack and Data */
+              uint32_t rwnd;  /* Ack and Data */
+              uint32_t seqno; /* Data only */
+              char data[1000]; /* Data only; Can be less than 500 bytes*/
+            };typedef struct packet packet_t;
+
+-->
+
 
 <pairs>
   <pair>
