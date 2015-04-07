@@ -107,6 +107,7 @@ void sendDataAcknowledgement(rel_t *r, uint32_t ackno) {
 	memset((void*) ackPacket, 0, ACK_PACKET_SIZE);
 	ackPacket->len = (uint16_t) ACK_PACKET_SIZE;
 	ackPacket->ackno = (uint32_t) ackno;
+	ackPacket->rwnd = 0; //TODO
 
 	changePacketToNetworkByteOrder((packet_t*) ackPacket);
 	ackPacket->cksum = cksum(ackPacket, ACK_PACKET_SIZE);
@@ -115,7 +116,8 @@ void sendDataAcknowledgement(rel_t *r, uint32_t ackno) {
 }
 
 bool isSendingWindowFull(rel_t *r) {
-	return r->sWindow->head != NULL && (ntohl(r->sWindow->tail->pkt->seqno) - ntohl(r->sWindow->head->pkt->seqno)) >= r->congestion_window;
+	return r->sWindow->head != NULL &&
+			(ntohl(r->sWindow->tail->pkt->seqno) - ntohl(r->sWindow->head->pkt->seqno)) >= r->congestion_window;
 }
 
 
@@ -370,6 +372,7 @@ void buildPacket(rel_t *r, int bytes, packet_t *pkt) {
 	pkt->seqno = (tail) ? (uint32_t) ntohl(tail->pkt->seqno) + 1 : (uint32_t) r->sWindow->next_seqno;
 	pkt->len = (uint16_t) ((bytes == -1) ? EOF_PACKET_SIZE : DATA_PACKET_HEADER_SIZE + bytes);
 	pkt->ackno = 0;
+	pkt->rwnd = 0; //TODO
 	changePacketToNetworkByteOrder(pkt);
 
 	pkt->cksum = cksum(pkt, ntohs(pkt->len));
