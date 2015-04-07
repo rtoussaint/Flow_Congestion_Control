@@ -235,6 +235,8 @@ void addinorder_recv(rel_t *r, packet_t *pkt)
 
 	packet_wrapper *temp = r->rWindow->head;
 
+	r->rWindow->adv_window = r->rWindow->adv_window - 1;
+
 	if(temp == NULL) {
 		r->rWindow->head = r->rWindow->tail = newWrapper;
 		return;
@@ -248,6 +250,7 @@ void addinorder_recv(rel_t *r, packet_t *pkt)
 	while(temp != NULL) {
 		packet_wrapper *next = temp->next;
 		if(temp->pkt->seqno == pkt->seqno) {
+			r->rWindow->adv_window = r->rWindow->adv_window + 1;
 			free(newWrapper);
 			break;
 		}
