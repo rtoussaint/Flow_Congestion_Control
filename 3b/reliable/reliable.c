@@ -80,7 +80,7 @@ struct reliable_state {
 	double aimd_initial_cw;
 	double congestion_window;
 
-	duplicate_tracker dup_tracker;
+	duplicate_tracker *dup_tracker;
 
 };
 
@@ -164,6 +164,11 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 	memset(r->rWindow, 0, sizeof(recv_buffer));
 	r->rWindow->next_expected = 1;
 	r->rWindow->max_size = cc->window;
+
+	r->dup_tracker = (duplicate_tracker *) xmalloc(sizeof(duplicate_tracker));
+	memset(r->dup_tracker, 0, sizeof(duplicate_tracker));
+	r->dup_tracker->ackno = 0;
+	r->dup_tracker->frequency = 0;
 
 	r->sState = SENDING;
 	r->rState = RECEIVING;
@@ -303,41 +308,44 @@ void addinorder_recv(rel_t *r, packet_t *pkt)
 	}
 }
 
-
-void
-tcpReno(packet_t *pkt) {
-
-	if(rel_list->congestion_window >= 2) {
-		rel_list->congestion_window = rel_list->ssthresh = rel_list->congestion_window / 2;
-	}
-	rel_list->congestionWindowMethod = AIMD;
-
-	packet_wrapper *wrapper = rel_list->sWindow->head;
-	while(wrapper != NULL) {
-		if(wrapper->pkt->seqno >= pkt->ackno - 1) {
-			sendDataPacket(rel_list, wrapper);
-		}
-		wrapper = wrapper->next;
-	}
-}
-
 bool
-isThirdDuplicateAck(packet_t* pkt) {
-	if(rel_list->dup_tracker->ackno == pkt->ackno) {
-		rel_list->dup_tracker->frequency += 1;
+isThirdDuplicateAck(rel_t *r, packet_t* pkt) {
+	if(r->dup_tracker->ackno == pkt->ackno) {
+		r->dup_tracker->frequency += 1;
 	}
 	else {
-		rel_list->dup_tracker->ackno = pkt->ackno;
-		rel_list->dup_tracker->frequency = 1;
+		r->dup_tracker->ackno = pkt->ackno;
+		r->dup_tracker->frequency = 1;
 	}
 
-	if(rel_list->dup_tracker->frequency == 3) {
-		rel_list->dup_tracker->frequency = 0;
+	if(r->dup_tracker->frequency == 3) {
+		r->dup_tracker->frequency = 0;
 		return true;
 	}
 	return false;
 }
 
+void sendDataPacket(rel_t* r, packet_wrapper* wrapper) {
+	clock_gettime(CLOCK_MONOTONIC, &wrapper->timeSent);
+	conn_sendpkt(r->c, wrapper->pkt, ntohs (wrapper->pkt->len));
+}
+
+void
+tcpReno(rel_t *r, packet_t *pkt) {
+
+	if(r->congestion_window >= 2) {
+		r->congestion_window = rel_list->ssthresh = rel_list->congestion_window / 2;
+	}
+	r->congestionWindowMethod = AIMD;
+
+	packet_wrapper *wrapper = r->sWindow->head;
+	while(wrapper != NULL) {
+		if(wrapper->pkt->seqno >= pkt->ackno - 1) {
+			sendDataPacket(r, wrapper);
+		}
+		wrapper = wrapper->next;
+	}
+}
 
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
@@ -348,8 +356,8 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 	changePacketToHostByteOrder(pkt);
 
 	if(isValidAckToBeHandled(r, pkt)) {
-		if(isThirdDuplicateAck(pkt)) {
-			tcpReno(pkt);
+		if(isThirdDuplicateAck(r, pkt)) {
+			tcpReno(r, pkt);
 			return;
 		}
 		handleAck(r, pkt);
@@ -359,13 +367,6 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 		rel_output(r);
 	}
 }
-
-
-void sendDataPacket(rel_t* r, packet_wrapper* wrapper) {
-	clock_gettime(CLOCK_MONOTONIC, &wrapper->timeSent);
-	conn_sendpkt(r->c, wrapper->pkt, ntohs (wrapper->pkt->len));
-}
-
 
 void buildPacket(rel_t *r, int bytes, packet_t *pkt) {
 	packet_wrapper *tail = r->sWindow->tail;
