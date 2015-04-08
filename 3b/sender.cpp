@@ -34,7 +34,7 @@ using namespace std;
 
 /***************************************/
 //you may need to change these configurations according to relayer's config.xml
-char* host_name = (char*)"linux25";//relayer's host name
+char* host_name = (char*)"localhost";//relayer's host name
 short int sender_port = 10000;     //this sender's sending port
 short int relayer_port = 50001;    //relayer's listening port
 /***************************************/
