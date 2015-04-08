@@ -59,6 +59,7 @@ typedef struct duplicate_tracker {
 	uint32_t frequency;
 } duplicate_tracker;
 
+typedef struct timeval timeval;
 
 struct reliable_state {
 
@@ -79,7 +80,10 @@ struct reliable_state {
 	double ssthresh;
 	double aimd_initial_cw;
 	double congestion_window;
-
+	bool started;
+	timeval start;
+	timeval end;
+	uint32_t bytes_rcvd;
 	duplicate_tracker *dup_tracker;
 
 };
@@ -174,6 +178,8 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 	r->rState = RECEIVING;
 
 	r->congestionWindowMethod = SLOW_START;
+	r->bytes_rcvd = 0;
+	r->started = false;
 
 	return r;
 }
@@ -182,7 +188,10 @@ void
 rel_destroy (rel_t *r)
 {
 
-	printf("REL DESTROY CALLED\n");
+	gettimeofday(&r->end, NULL);
+	if (r->c->sender_receiver == RECEIVER) {
+		printf("estimated bandwidth was %f kb/s\n", (8.0 * r->bytes_rcvd) / (r->end.tv_sec - r->start.tv_sec) / 1000.0);
+	}
 
 	conn_destroy (r->c);
 
@@ -257,6 +266,13 @@ void handleAck(rel_t* r, packet_t *pkt) {
 }
 
 bool isValidDataPacket(rel_t *r, packet_t* pkt) {
+
+	if (!r->started) {
+		r->started = true;
+		r->bytes_rcvd = r->bytes_rcvd + pkt->len;
+		gettimeofday(&r->start, NULL);
+	}
+
 	return r->rState == RECEIVING && 				//Have not received the EOF
 			pkt->seqno >= r->rWindow->next_expected &&		//There is not already an unacked packet in the sending window.
 			pkt->seqno <=  r->rWindow->next_expected + r->rWindow->max_size; 	//The data packet is the one we were expecting
@@ -350,9 +366,15 @@ tcpReno(rel_t *r, packet_t *pkt) {
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
+
+	if (r->started) {
+		r->bytes_rcvd = r->bytes_rcvd + ntohs(pkt->len);
+	}
+
 	if((size_t) ntohs(pkt->len) != n || isPacketChecksumInvalid(pkt)) {
 		return;
 	}
+
 	changePacketToHostByteOrder(pkt);
 
 	if(isValidAckToBeHandled(r, pkt)) {
