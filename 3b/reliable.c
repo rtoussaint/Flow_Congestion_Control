@@ -465,6 +465,9 @@ packetHasTimedOut(struct timespec timeLastTransmitted, int timeout) {
 void
 rel_timer ()
 {
+	if(!rel_list || !rel_list->c)
+		return;
+
 	if(rel_list->c->sender_receiver == RECEIVER && rel_list->sState == SENDING) {
 		rel_read(rel_list);
 	}
