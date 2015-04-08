@@ -1,0 +1,7 @@
+./relayer config.xml
+
+./reliable -r out1 -w 200 20000 localhost:50002
+./reliable -r out2 -w 200 40000 localhost:50004
+
+./reliable -s in1 10000 localhost:50001
+./reliable -s in2 30000 localhost:50003
