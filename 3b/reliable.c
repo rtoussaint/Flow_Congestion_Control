@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
+#include <math.h>
 
 #include "rlib.h"
 
@@ -57,6 +58,7 @@ typedef struct recv_buffer {
 typedef struct duplicate_tracker {
 	uint32_t ackno;
 	uint32_t frequency;
+	uint32_t last_dup;
 } duplicate_tracker;
 
 typedef struct timeval timeval;
@@ -78,16 +80,17 @@ struct reliable_state {
 
 	enum congestionWindowMethod congestionWindowMethod;
 	double ssthresh;
-	double aimd_initial_cw;
+	uint32_t aimd_initial_cw;
 	double congestion_window;
-	bool started;
+	bool send_started;
+	bool recv_started;
+	bool added_eof;
 	timeval start;
 	timeval end;
-	uint32_t bytes_rcvd;
+	uint32_t packets_rcvd;
 	duplicate_tracker *dup_tracker;
 
 };
-
 
 void changePacketToHostByteOrder (packet_t *pkt) {
 	if(pkt->seqno)
@@ -111,7 +114,7 @@ void sendDataAcknowledgement(rel_t *r, uint32_t ackno) {
 	memset((void*) ackPacket, 0, ACK_PACKET_SIZE);
 	ackPacket->len = (uint16_t) ACK_PACKET_SIZE;
 	ackPacket->ackno = (uint32_t) ackno;
-	ackPacket->rwnd = 0; //TODO
+	ackPacket->rwnd = (uint32_t) r->rWindow->max_size;
 
 	changePacketToNetworkByteOrder((packet_t*) ackPacket);
 	ackPacket->cksum = cksum(ackPacket, ACK_PACKET_SIZE);
@@ -173,13 +176,15 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 	memset(r->dup_tracker, 0, sizeof(duplicate_tracker));
 	r->dup_tracker->ackno = 0;
 	r->dup_tracker->frequency = 0;
+	r->dup_tracker->last_dup = 0;
 
 	r->sState = SENDING;
 	r->rState = RECEIVING;
 
 	r->congestionWindowMethod = SLOW_START;
-	r->bytes_rcvd = 0;
-	r->started = false;
+	r->packets_rcvd = 0;
+	r->send_started = false;
+	r->recv_started = false;
 
 	return r;
 }
@@ -187,10 +192,11 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
 void
 rel_destroy (rel_t *r)
 {
-
 	gettimeofday(&r->end, NULL);
 	if (r->c->sender_receiver == RECEIVER) {
-		printf("estimated bandwidth was %f kb/s\n", (8.0 * r->bytes_rcvd) / (r->end.tv_sec - r->start.tv_sec) / 1000.0);
+		printf("packets received: %d\n", r->packets_rcvd);
+		printf("time: %f\n", (double) (r->end.tv_sec - r->start.tv_sec));
+		printf("estimated bandwidth was %f kb/s\n", (8.0 * r->packets_rcvd * DATA_PACKET_SIZE) / (r->end.tv_sec - r->start.tv_sec) / 1000.0);
 	}
 
 	conn_destroy (r->c);
@@ -198,10 +204,10 @@ rel_destroy (rel_t *r)
 	/* Free any other allocated memory here */
 	free(r->sWindow);
 	free(r->rWindow);
+	free(r->dup_tracker);
 	free(r);
 
 }
-
 
 void
 rel_demux (const struct config_common *cc,
@@ -228,8 +234,7 @@ bool isSendingWindowEmpty(rel_t *r) {
 }
 
 bool isValidAckToBeHandled(rel_t* r, packet_t* pkt) {
-	return 	pkt->len == ACK_PACKET_SIZE &&
-			!isSendingWindowEmpty(r) && 					//A packet exists to be acked.
+	return 	!isSendingWindowEmpty(r) && 					//A packet exists to be acked.
 			r->sState != SENDER_DONE &&					//The sender has not received an ack for the EOF
 			ntohl(r->sWindow->head->pkt->seqno) < pkt->ackno;	//The ack acks the current packet in the sending window.
 }
@@ -238,12 +243,18 @@ void increaseCongestionWindow(rel_t* r) {
 
 	if(r->congestion_window > r->ssthresh - 1) {
 		r->congestionWindowMethod = AIMD;
+		r->aimd_initial_cw = (uint32_t) (r->congestion_window / 1);
 	}
 
-	r->congestion_window += (r->congestionWindowMethod == SLOW_START) ? 1 : 1/r->aimd_initial_cw;
+	if (r->congestion_window >= r->aimd_initial_cw + 1) {
+		r->aimd_initial_cw += 1;
+	}
+
+	r->congestion_window += (r->congestionWindowMethod == SLOW_START) ? 1 : 1 / (double) r->aimd_initial_cw;
 }
 
 void handleAck(rel_t* r, packet_t *pkt) {
+
 	packet_wrapper *temp = r->sWindow->head;
 	while(temp != NULL && ntohl(temp->pkt->seqno) < pkt->ackno) {
 		r->sWindow->head = temp->next;
@@ -253,7 +264,6 @@ void handleAck(rel_t* r, packet_t *pkt) {
 		if(temp == NULL) {
 			r->sWindow->tail = NULL;
 		}
-
 		increaseCongestionWindow(r);
 	}
 
@@ -267,11 +277,7 @@ void handleAck(rel_t* r, packet_t *pkt) {
 
 bool isValidDataPacket(rel_t *r, packet_t* pkt) {
 
-	if (!r->started) {
-		r->started = true;
-		r->bytes_rcvd = r->bytes_rcvd + pkt->len;
-		gettimeofday(&r->start, NULL);
-	}
+	r->packets_rcvd = r->packets_rcvd + 1;
 
 	return r->rState == RECEIVING && 				//Have not received the EOF
 			pkt->seqno >= r->rWindow->next_expected &&		//There is not already an unacked packet in the sending window.
@@ -326,15 +332,16 @@ void addinorder_recv(rel_t *r, packet_t *pkt)
 
 bool
 isThirdDuplicateAck(rel_t *r, packet_t* pkt) {
-	if(r->dup_tracker->ackno == pkt->ackno) {
+
+	if(r->dup_tracker->ackno == pkt->ackno && pkt->ackno != r->dup_tracker->last_dup) {
 		r->dup_tracker->frequency += 1;
 	}
 	else {
 		r->dup_tracker->ackno = pkt->ackno;
 		r->dup_tracker->frequency = 1;
 	}
-
 	if(r->dup_tracker->frequency == 3) {
+		r->dup_tracker->last_dup = r->dup_tracker->ackno;
 		r->dup_tracker->frequency = 0;
 		return true;
 	}
@@ -356,8 +363,9 @@ tcpReno(rel_t *r, packet_t *pkt) {
 
 	packet_wrapper *wrapper = r->sWindow->head;
 	while(wrapper != NULL) {
-		if(wrapper->pkt->seqno >= pkt->ackno - 1) {
+		if(ntohl(wrapper->pkt->seqno) >= pkt->ackno - 1) {
 			sendDataPacket(r, wrapper);
+			break;
 		}
 		wrapper = wrapper->next;
 	}
@@ -367,24 +375,25 @@ void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
 
-	if (r->started) {
-		r->bytes_rcvd = r->bytes_rcvd + ntohs(pkt->len);
-	}
-
 	if((size_t) ntohs(pkt->len) != n || isPacketChecksumInvalid(pkt)) {
 		return;
 	}
 
 	changePacketToHostByteOrder(pkt);
 
-	if(isValidAckToBeHandled(r, pkt)) {
+	if (pkt->len == ACK_PACKET_SIZE) {
 		if(isThirdDuplicateAck(r, pkt)) {
 			tcpReno(r, pkt);
-			return;
 		}
-		handleAck(r, pkt);
+		else if(isValidAckToBeHandled(r, pkt)) {
+			handleAck(r, pkt);
+		}
 	}
 	else if(isValidDataPacket(r, pkt)) {
+		if (r->recv_started == false && r->c->sender_receiver == RECEIVER) {
+			gettimeofday(&r->start, NULL);
+			r->recv_started = true;
+		}
 		addinorder_recv(r, pkt);
 		rel_output(r);
 	}
@@ -393,9 +402,9 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 void buildPacket(rel_t *r, int bytes, packet_t *pkt) {
 	packet_wrapper *tail = r->sWindow->tail;
 	pkt->seqno = (tail) ? (uint32_t) ntohl(tail->pkt->seqno) + 1 : (uint32_t) r->sWindow->next_seqno;
-	pkt->len = (uint16_t) ((bytes == -1) ? EOF_PACKET_SIZE : DATA_PACKET_HEADER_SIZE + bytes);
+	pkt->len = (uint16_t) ((bytes == -1) ? EOF_PACKET_SIZE : (DATA_PACKET_HEADER_SIZE + bytes));
 	pkt->ackno = 0;
-	pkt->rwnd = 0; //TODO
+	pkt->rwnd = r->rWindow->max_size;
 	changePacketToNetworkByteOrder(pkt);
 
 	pkt->cksum = cksum(pkt, ntohs(pkt->len));
@@ -422,24 +431,39 @@ rel_read (rel_t *s) {
 	packet_wrapper* newWrapper;
 	packet_t* packetToSend;
 
-	while(!isSendingWindowFull(s) && s->sState == SENDING) {
+	if (s->c->sender_receiver == RECEIVER && s->added_eof == false) {
 		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
 		memset(packetToSend, 0, sizeof(packet_t));
-		conn_stdin_value = (s->c->sender_receiver == RECEIVER) ? -1 : conn_input(s->c, packetToSend->data, MAX_PAYLOAD_SIZE);
+		buildPacket(s, -1, packetToSend);
+		newWrapper = add_end_to_s_window(s, packetToSend);
+		print_pkt(packetToSend, "eof", 16);
+		sendDataPacket(s, newWrapper);
+		s->added_eof = true;
+	}
+	else {
 
-		if(conn_stdin_value != 0) {
-			buildPacket(s, conn_stdin_value, packetToSend);
-			newWrapper = add_end_to_s_window(s, packetToSend);
-			sendDataPacket(s, newWrapper);
-			if (conn_stdin_value == -1) {
-				s->sState = WAITING_FOR_EOF_ACK;
-				printf("Waiting for eof ack\n");
+		while(!isSendingWindowFull(s) && s->sState == SENDING) {
+			if (s->c->sender_receiver == SENDER && s->send_started == false) {
+				return;
 			}
-			s->sWindow->next_seqno += 1;
-		}
-		else {
-			free(packetToSend);
-			break;
+			packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
+			memset(packetToSend, 0, sizeof(packet_t));
+			conn_stdin_value = (s->c->sender_receiver == RECEIVER) ? -1 : conn_input(s->c, packetToSend->data, MAX_PAYLOAD_SIZE);
+
+			if(conn_stdin_value != 0) {
+				buildPacket(s, conn_stdin_value, packetToSend);
+				newWrapper = add_end_to_s_window(s, packetToSend);
+				sendDataPacket(s, newWrapper);
+				if (conn_stdin_value == -1) {
+					s->sState = WAITING_FOR_EOF_ACK;
+				}
+				s->sWindow->next_seqno += 1;
+			}
+			else {
+				free(packetToSend);
+				break;
+			}
+
 		}
 	}
 }
@@ -451,15 +475,26 @@ rel_output (rel_t *r) {
 	while(temp != NULL && temp->pkt->seqno == r->rWindow->next_expected) {
 		int bytesToWrite =  temp->pkt->len - DATA_PACKET_HEADER_SIZE;
 		if(conn_bufspace(r->c) > bytesToWrite) {
-			conn_output(r->c, temp->pkt->data, bytesToWrite);
+			if (r->c->sender_receiver == RECEIVER)
+				conn_output(r->c, temp->pkt->data, bytesToWrite);
 			r->rWindow->head = temp->next;
-
 			if(temp->pkt->len == EOF_PACKET_SIZE) {
-				r->rState = RECEIVER_DONE;
-				if(r->sState == SENDER_DONE) {
-					sendDataAcknowledgement(r, r->rWindow->next_expected + 1);
-					destroyConnectionIfAppropriate(r);
-					return;
+				if (r->send_started == false && r->c->sender_receiver == SENDER) {
+					if (r->rState == RECEIVING) {
+						r->sWindow->max_size = r->ssthresh = r->aimd_initial_cw = temp->pkt->rwnd;
+						r->sWindow->next_seqno = 1;
+						r->congestion_window = 1;
+						r->send_started = true;
+						rel_read(r);
+					}
+				}
+				else {
+					r->rState = RECEIVER_DONE;
+					if(r->sState == SENDER_DONE) {
+						sendDataAcknowledgement(r, r->rWindow->next_expected + 1);
+						destroyConnectionIfAppropriate(r);
+						return;
+					}
 				}
 			}
 
@@ -483,7 +518,6 @@ packetHasTimedOut(struct timespec timeLastTransmitted, int timeout) {
 	return 1000*(currentTime.tv_sec - timeLastTransmitted.tv_sec) > timeout;
 }
 
-
 void
 rel_timer ()
 {
@@ -498,17 +532,18 @@ rel_timer ()
 	bool timeout_found = false;
 	while(wrapper != NULL) {
 		if(!timeout_found && packetHasTimedOut(wrapper->timeSent, rel_list->timeout)) {
-			if(rel_list->ssthresh >= 2) {
+			if(rel_list->ssthresh >= 2 && rel_list->congestion_window >= 2) {
 				rel_list->ssthresh = rel_list->congestion_window / 2;
 			}
 			rel_list->congestion_window = 1;
 			rel_list->congestionWindowMethod = SLOW_START;
 			timeout_found = true;
 			sendDataPacket(rel_list, wrapper);
+			return;
 		}
-		else if(timeout_found) {
-			sendDataPacket(rel_list, wrapper);
-		}
+		//		else if(timeout_found) {
+		//			sendDataPacket(rel_list, wrapper);
+		//		}
 		wrapper = wrapper->next;
 	}
 }

@@ -5,3 +5,13 @@
 
 ./reliable -s in1 10000 localhost:50001
 ./reliable -s in2 30000 localhost:50003
+
+//		const char *state;
+//		if (r->congestionWindowMethod == AIMD) {
+//			state = "AIMD";
+//		}
+//		else if (r->congestionWindowMethod == SLOW_START) {
+//			state = "SS";
+//		}
+
+		//printf("%s: (window = %f) (thresh = %f) (temp = %d)\n", state, r->congestion_window, r->ssthresh, r->aimd_initial_cw);
