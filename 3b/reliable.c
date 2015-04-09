@@ -356,16 +356,19 @@ void sendDataPacket(rel_t* r, packet_wrapper* wrapper) {
 void
 tcpReno(rel_t *r, packet_t *pkt) {
 
+	printf("%f\n", r->congestion_window);
+
 	if(r->congestion_window >= 2) {
-		r->congestion_window = rel_list->ssthresh = rel_list->congestion_window / 2;
+		rel_list->ssthresh = rel_list->congestion_window / 2;
+		r->congestion_window = rel_list->congestion_window / 2 + 3;
 	}
 	r->congestionWindowMethod = AIMD;
+	r->aimd_initial_cw = (uint32_t) (r->congestion_window / 1);
 
 	packet_wrapper *wrapper = r->sWindow->head;
 	while(wrapper != NULL) {
 		if(ntohl(wrapper->pkt->seqno) >= pkt->ackno - 1) {
 			sendDataPacket(r, wrapper);
-			break;
 		}
 		wrapper = wrapper->next;
 	}
@@ -431,16 +434,15 @@ rel_read (rel_t *s) {
 	packet_wrapper* newWrapper;
 	packet_t* packetToSend;
 
-	if (s->c->sender_receiver == RECEIVER && s->added_eof == false) {
-		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
-		memset(packetToSend, 0, sizeof(packet_t));
-		buildPacket(s, -1, packetToSend);
-		newWrapper = add_end_to_s_window(s, packetToSend);
-		print_pkt(packetToSend, "eof", 16);
-		sendDataPacket(s, newWrapper);
-		s->added_eof = true;
-	}
-	else {
+//	if (s->c->sender_receiver == RECEIVER && s->added_eof == false) {
+//		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
+//		memset(packetToSend, 0, sizeof(packet_t));
+//		buildPacket(s, -1, packetToSend);
+//		newWrapper = add_end_to_s_window(s, packetToSend);
+//		sendDataPacket(s, newWrapper);
+//		s->added_eof = true;
+//	}
+//	else {
 
 		while(!isSendingWindowFull(s) && s->sState == SENDING) {
 			if (s->c->sender_receiver == SENDER && s->send_started == false) {
@@ -465,7 +467,7 @@ rel_read (rel_t *s) {
 			}
 
 		}
-	}
+//	}
 }
 
 void
@@ -521,6 +523,8 @@ packetHasTimedOut(struct timespec timeLastTransmitted, int timeout) {
 void
 rel_timer ()
 {
+
+	printf("receiver finished: %d, sender finished: %d", rel_list->rState == RECEIVER_DONE, rel_list->sState == SENDER_DONE);
 	if(!rel_list || !rel_list->c)
 		return;
 
@@ -538,12 +542,12 @@ rel_timer ()
 			rel_list->congestion_window = 1;
 			rel_list->congestionWindowMethod = SLOW_START;
 			timeout_found = true;
+			printf("Cur: %d Last: %d\n", ntohl(wrapper->pkt->seqno), ntohl(rel_list->sWindow->tail->pkt->seqno));
 			sendDataPacket(rel_list, wrapper);
-			return;
 		}
-		//		else if(timeout_found) {
-		//			sendDataPacket(rel_list, wrapper);
-		//		}
+		else if(timeout_found) {
+			sendDataPacket(rel_list, wrapper);
+		}
 		wrapper = wrapper->next;
 	}
 }
