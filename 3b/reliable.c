@@ -356,8 +356,6 @@ void sendDataPacket(rel_t* r, packet_wrapper* wrapper) {
 void
 tcpReno(rel_t *r, packet_t *pkt) {
 
-	printf("%f\n", r->congestion_window);
-
 	if(r->congestion_window >= 2) {
 		rel_list->ssthresh = rel_list->congestion_window / 2;
 		r->congestion_window = rel_list->congestion_window / 2 + 3;
@@ -530,7 +528,6 @@ rel_timer ()
 			rel_list->congestion_window = 1;
 			rel_list->congestionWindowMethod = SLOW_START;
 			timeout_found = true;
-			printf("Cur: %d Last: %d\n", ntohl(wrapper->pkt->seqno), ntohl(rel_list->sWindow->tail->pkt->seqno));
 			sendDataPacket(rel_list, wrapper);
 		}
 		else if(timeout_found) {
