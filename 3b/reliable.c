@@ -434,40 +434,28 @@ rel_read (rel_t *s) {
 	packet_wrapper* newWrapper;
 	packet_t* packetToSend;
 
-//	if (s->c->sender_receiver == RECEIVER && s->added_eof == false) {
-//		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
-//		memset(packetToSend, 0, sizeof(packet_t));
-//		buildPacket(s, -1, packetToSend);
-//		newWrapper = add_end_to_s_window(s, packetToSend);
-//		sendDataPacket(s, newWrapper);
-//		s->added_eof = true;
-//	}
-//	else {
-
-		while(!isSendingWindowFull(s) && s->sState == SENDING) {
-			if (s->c->sender_receiver == SENDER && s->send_started == false) {
-				return;
-			}
-			packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
-			memset(packetToSend, 0, sizeof(packet_t));
-			conn_stdin_value = (s->c->sender_receiver == RECEIVER) ? -1 : conn_input(s->c, packetToSend->data, MAX_PAYLOAD_SIZE);
-
-			if(conn_stdin_value != 0) {
-				buildPacket(s, conn_stdin_value, packetToSend);
-				newWrapper = add_end_to_s_window(s, packetToSend);
-				sendDataPacket(s, newWrapper);
-				if (conn_stdin_value == -1) {
-					s->sState = WAITING_FOR_EOF_ACK;
-				}
-				s->sWindow->next_seqno += 1;
-			}
-			else {
-				free(packetToSend);
-				break;
-			}
-
+	while(!isSendingWindowFull(s) && s->sState == SENDING) {
+		if (s->c->sender_receiver == SENDER && s->send_started == false) {
+			return;
 		}
-//	}
+		packetToSend = (packet_t*) xmalloc(sizeof(packet_t));
+		memset(packetToSend, 0, sizeof(packet_t));
+		conn_stdin_value = (s->c->sender_receiver == RECEIVER) ? -1 : conn_input(s->c, packetToSend->data, MAX_PAYLOAD_SIZE);
+
+		if(conn_stdin_value != 0) {
+			buildPacket(s, conn_stdin_value, packetToSend);
+			newWrapper = add_end_to_s_window(s, packetToSend);
+			sendDataPacket(s, newWrapper);
+			if (conn_stdin_value == -1) {
+				s->sState = WAITING_FOR_EOF_ACK;
+			}
+			s->sWindow->next_seqno += 1;
+		}
+		else {
+			free(packetToSend);
+			break;
+		}
+	}
 }
 
 void
@@ -487,7 +475,8 @@ rel_output (rel_t *r) {
 						r->sWindow->next_seqno = 1;
 						r->congestion_window = 1;
 						r->send_started = true;
-						rel_read(r);
+						r->rState = RECEIVER_DONE;
+						rel_read(rel_list);
 					}
 				}
 				else {
@@ -524,7 +513,6 @@ void
 rel_timer ()
 {
 
-	printf("receiver finished: %d, sender finished: %d", rel_list->rState == RECEIVER_DONE, rel_list->sState == SENDER_DONE);
 	if(!rel_list || !rel_list->c)
 		return;
 
